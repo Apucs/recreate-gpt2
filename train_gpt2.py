@@ -103,6 +103,41 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    def forward(self, idx):
+        # idx is of shape (B,T) where B is the batch size and T is the sequence length
+        # we need to get the position embeddings for each token in the sequence
+        # and add them to the token embeddings
+        # idx is the input tensor of shape (B,T)
+        # wte is the word embedding tensor of shape (vocab_size, n_embd)
+        # wpe is the position embedding tensor of shape (block_size, n_embd)
+        # wte(idx) is the word embedding of shape (B,T,n_embd)
+        # wpe(idx) is the position embedding of shape (B,T,n_embd)
+        # wte(idx) + wpe(idx) is the input tensor of shape (B,T,n_embd)
+        # we need to transpose the input tensor to (T,B,n_embd) for the transformer
+        # transformer is a ModuleDict of the transformer layers
+        # h is a ModuleList of the transformer layers
+        # ln_f is the final layer norm
+        # lm_head is the final linear layer
+        B,T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        # forward the token embeddings and position embeddings through the transformer
+        pos = torch.arange(T, dtype=torch.long, device=idx.device) # (T,)
+        pos_emb = self.transformer.wpe(pos) # (T,n_embd)
+        tok_emb = self.transformer.wte(idx) # (B,T,n_embd)
+        x = tok_emb + pos_emb # (B,T,n_embd)
+
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        
+        # forward the final layer norm and the classification head
+        x = self.transformer.ln_f(x) # (B,T,n_embd)
+        logits = self.lm_head(x) # (B,T,vocab_size)
+
+        return logits
+
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -156,9 +191,61 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-    
+
 
 #--------------------------------------------------------
+# attemt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
 
-model = GPT.from_pretrained('gpt2')
-print("didn't crash yay!")
+print(f"using device: {device}")
+
+max_return_sequences = 5
+max_length = 30
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
+model.eval()
+model.to(device)
+# model.to('cuda')
+# model.to('cpu')
+# print("didn't crash yay!")
+
+#prefix tokens
+import tiktoken
+
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(max_return_sequences, 1) # (5,8)
+x = tokens.to(device)
+# x = tokens.to('cuda')
+# x = tokens.to('cpu')
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x) # (B,T,vocab_size)
+        # take the logits of the last position
+        logits = logits[:, -1, :] # (B,vocab_size)
+        probs = F.softmax(logits, dim=-1) # (B,vocab_size)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5,50), topk_indices is (5,50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, 1) # (B,1)
+        # gather the corresponding indices from the top-k indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B,1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1) # (B,T+1)
+
+# print the generated text
+for i in range(max_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">",decoded)
