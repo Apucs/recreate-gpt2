@@ -103,7 +103,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is of shape (B,T) where B is the batch size and T is the sequence length
         # we need to get the position embeddings for each token in the sequence
         # and add them to the token embeddings
@@ -135,7 +135,11 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x) # (B,T,n_embd)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # (B*T, vocab_size) vs (B*T,)
+        
+        return logits, loss
 
 
     @classmethod
@@ -202,9 +206,10 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 
 print(f"using device: {device}")
-
+# ------------------------------------------------------------
 # get data batch
 import tiktoken
+
 enc = tiktoken.get_encoding("gpt2")
 with open('input.txt', 'r') as f:
     text = f.read()
@@ -212,15 +217,28 @@ text = text[:1000]
 tokens = enc.encode(text)
 B,T = 4, 32
 buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)  # move to the detected device
 x = buf[:-1].view(B,T)
 y = buf[1:].view(B,T)
 
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
-logits = model(x)
+# logits, loss = model(x, y)
 
-print(logits.shape)
+# optimize!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x.to(device), y.to(device)) # (B,T,vocab_size), (B,)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i+1}, loss: {loss.item()}")
+
+
+print(loss.item())
+#--------------------------------------------------------
 import sys; sys.exit(0)
 
 # prefix tokens
